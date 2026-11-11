@@ -19,6 +19,25 @@
 
 **注意：本项目仍处于早期开发阶段，存在许多不足，我们需要您的帮助来完善它！**
 
+## OpenVINO 分支开发说明
+
+此 Fork 正在增加一个**可选的 OpenVINO 推理后端**，主要目标是在保留原项目 CPU、CUDA、MPS 与 PyTorch XPU 路径的同时，为 Intel 核显增加更通用的推理加速支持。
+
+当前开发分支：`openvino-v0.1`
+
+**当前状态：开发中——此分支目前尚未完成 OpenVINO 加速，请勿将下列内容视为已实现功能。**
+
+迭代计划：
+
+- **v0.1：**拆分/建立推理后端基础层，引入 OpenVINO Runtime；优先实现 CTD 文本检测与 `48px_ctc` OCR 的 OpenVINO GPU 推理，并保留 CPU 回退。
+- **v0.2：**评估并增加 Default/CRAFT 文本检测以及 `4xUltraSharp` 超分的 OpenVINO 路径。
+- **v0.3：**评估 AOT 修复、MC2 上色；结构复杂或收益有限的模型仅在兼容性与性能值得的情况下继续迁移。
+- Real-ESRGAN、Waifu2x 等当前已经使用 ncnn/Vulkan 的功能，原则上继续保留原生后端，不为了 OpenVINO 而重复重写。
+
+第一阶段刻意只聚焦最有收益的 OCR 主链路：**文字检测 → OCR 神经网络推理 → 现有 CPU 后处理**，其中神经网络推理在硬件支持时交给 Intel GPU。
+
+详细范围与兼容策略见 [OPENVINO_ROADMAP.md](OPENVINO_ROADMAP.md)。
+
 
 ## 📂 目录
 

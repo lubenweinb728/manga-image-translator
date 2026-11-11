@@ -19,6 +19,25 @@ This project is v2 of [Qiú wén zhuǎn yì zhì](https://github.com/PatchyVideo
 
 **Note: This project is still in the early stages of development and has many shortcomings. We need your help to improve it!**
 
+## OpenVINO fork development status
+
+This fork is adding an **optional OpenVINO inference backend** focused on Intel integrated GPU acceleration while preserving the upstream CPU, CUDA, MPS and PyTorch XPU paths.
+
+Current development branch: `openvino-v0.1`
+
+**Status: in development — OpenVINO acceleration is not available yet in this branch.**
+
+Planned iterations:
+
+- **v0.1:** backend separation/foundation, OpenVINO runtime integration, CTD text detection on OpenVINO GPU, and `48px_ctc` OCR on OpenVINO GPU, with CPU fallback.
+- **v0.2:** evaluate/add OpenVINO paths for the Default/CRAFT detectors and `4xUltraSharp` upscaling.
+- **v0.3:** evaluate AOT inpainting and MC2 colorization; more complex models will only be migrated when compatibility and performance justify it.
+- Existing ncnn/Vulkan backends such as Real-ESRGAN and Waifu2x are intended to remain on their native backend rather than being rewritten solely for OpenVINO.
+
+The first milestone is deliberately limited to the high-value OCR pipeline: **text detection → OCR inference → existing CPU post-processing**, with Intel GPU used for neural-network inference where supported.
+
+See [OPENVINO_ROADMAP.md](OPENVINO_ROADMAP.md) for the detailed scope and compatibility policy.
+
 
 ## 📂 Directory
 
