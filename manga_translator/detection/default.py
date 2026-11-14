@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 import shutil
 import numpy as np
 import torch
@@ -11,15 +12,13 @@ from .default_utils import imgproc, dbnet_utils, craft_utils
 from .common import OfflineDetector
 from ..utils import TextBlock, Quadrilateral, det_rearrange_forward
 
-MODEL = None
-def det_batch_forward_default(batch: np.ndarray, device: str):
-    global MODEL
+def det_batch_forward_default(batch: np.ndarray, device: str, model):
     if isinstance(batch, list):
         batch = np.array(batch)
     batch = einops.rearrange(batch.astype(np.float32) / 127.5 - 1.0, 'n h w c -> n c h w')
     batch = torch.from_numpy(batch).to(device)
     with torch.no_grad():
-        db, mask = MODEL(batch)
+        db, mask = model(batch)
         db = db.sigmoid().cpu().numpy()
         mask = mask.cpu().numpy()
     return db, mask
@@ -39,32 +38,114 @@ class DefaultDetector(OfflineDetector):
             shutil.move('detect-20241225.ckpt', self._get_file_path('detect-20241225.ckpt'))
         super().__init__(*args, **kwargs)
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         self.model = TextDetectionDefault()
         sd = torch.load(self._get_file_path('detect-20241225.ckpt'), map_location='cpu')
         self.model.load_state_dict(sd['model'] if 'model' in sd else sd)
         self.model.eval()
         self.device = device
+        self.execution_devices = ['PyTorch CPU'] if device == 'cpu' else [device]
         if device.startswith('cuda') or device == 'mps' or device == 'xpu':
             self.model = self.model.to(self.device)
-        global MODEL
-        MODEL = self.model
+
+        if use_igpu:
+            self._load_openvino()
 
     async def _unload(self):
+        if getattr(self, 'use_igpu', False):
+            self.compiled_shapes.clear()
+            self.ov_model = None
+            self.core = None
         del self.model
+
+    def _forward(self, batch, device):
+        if getattr(self, 'use_igpu', False):
+            return self._forward_openvino(batch, device)
+        return det_batch_forward_default(batch, device, model=self.model)
+
+    def _load_openvino(self):
+        self.ov_device = os.environ.get('MANGA_OPENVINO_DEVICE', 'GPU')
+        self.precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if self.precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        self.compiled_shapes = OrderedDict()
+        self.execution_devices = ['PyTorch CPU']
+        self.ov_model = None
+        try:
+            import openvino as ov
+            self.core = ov.Core()
+            # The fully convolutional network supports spatial dimensions divisible by 256.
+            # Runtime specialization avoids dynamic-shape GPU requirements on old drivers.
+            with torch.inference_mode():
+                self.ov_model = ov.convert_model(
+                    self.model, example_input=torch.zeros(1, 3, 256, 256),
+                    input=[1, 3, -1, -1])
+        except Exception as exc:
+            self._fallback_openvino(exc)
+
+    def _fallback_openvino(self, exc):
+        self.ov_model = None
+        self.compiled_shapes.clear()
+        self.execution_devices = ['PyTorch CPU']
+        self.logger.warning('Default detector OpenVINO failed; using PyTorch CPU: %s', exc)
+
+    def _forward_openvino(self, batch, device):
+        if self.ov_model is None:
+            return det_batch_forward_default(batch, 'cpu', self.model)
+        try:
+            inputs = np.asarray(batch, dtype=np.float32) / 127.5 - 1.0
+            inputs = np.ascontiguousarray(inputs.transpose(0, 3, 1, 2))
+            outputs = []
+            # Batch one limits memory use and compiled-model variants on integrated GPUs.
+            for sample in inputs:
+                shape = (1, *sample.shape)
+                if shape not in self.compiled_shapes:
+                    model = self.ov_model.clone()
+                    model.reshape({model.input(0): list(shape)})
+                    config = {'INFERENCE_PRECISION_HINT': self.precision}
+                    cache = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+                    if cache:
+                        config['CACHE_DIR'] = cache
+                    # Evict before compiling to bound retained compiled models.
+                    if len(self.compiled_shapes) >= 2:
+                        self.compiled_shapes.popitem(last=False)
+                    compiled = self.core.compile_model(model, self.ov_device, config)
+                    self.compiled_shapes[shape] = compiled
+                    self.execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+                    self.logger.info('Default OpenVINO shape %s execution devices: %s',
+                                     shape, self.execution_devices)
+                self.compiled_shapes.move_to_end(shape)
+                compiled = self.compiled_shapes[shape]
+                result = compiled([sample[None]])
+                values = [np.array(result[port], copy=True) for port in compiled.outputs]
+                if (len(values) != 2 or any(x.ndim != 4 for x in values)
+                        or values[0].shape[1] != 2 or values[1].shape[1] != 1):
+                    raise ValueError('Unexpected default detector output layout')
+                # Conversion preserves the source tuple: DB logits, then sigmoid mask.
+                logits, mask = values
+                db = torch.from_numpy(logits).sigmoid().numpy()
+                outputs.append((db, mask))
+            return tuple(np.concatenate([x[i] for x in outputs], axis=0) for i in (0, 1))
+        except Exception as exc:
+            self._fallback_openvino(exc)
+            return det_batch_forward_default(batch, 'cpu', self.model)
+
 
     async def _infer(self, image: np.ndarray, detect_size: int, text_threshold: float, box_threshold: float,
                      unclip_ratio: float, verbose: bool = False):
 
         # TODO: Move det_rearrange_forward to common.py and refactor
-        db, mask = det_rearrange_forward(image, det_batch_forward_default, detect_size, 4, device=self.device, verbose=verbose)
+        db, mask = det_rearrange_forward(image, self._forward, detect_size, 4, device=self.device, verbose=verbose)
 
         if db is None:
             # rearrangement is not required, fallback to default forward
             img_resized, target_ratio, _, pad_w, pad_h = imgproc.resize_aspect_ratio(cv2.bilateralFilter(image, 17, 80, 80), detect_size, cv2.INTER_LINEAR, mag_ratio = 1)
             img_resized_h, img_resized_w = img_resized.shape[:2]
             ratio_h = ratio_w = 1 / target_ratio
-            db, mask = det_batch_forward_default([img_resized], self.device)
+            db, mask = self._forward([img_resized], self.device)
         else:
             img_resized_h, img_resized_w = image.shape[:2]
             ratio_w = ratio_h = 1

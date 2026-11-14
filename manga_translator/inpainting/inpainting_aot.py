@@ -23,7 +23,10 @@ class AotInpainter(LamaMPEInpainter):
             shutil.move('inpainting.ckpt', self._get_file_path('inpainting.ckpt'))
         super().__init__(*args, **kwargs)
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         self.model = AOTGenerator()
         sd = torch.load(self._get_file_path('inpainting.ckpt'), map_location='cpu')
         self.model.load_state_dict(sd['model'] if 'model' in sd else sd)
@@ -31,6 +34,11 @@ class AotInpainter(LamaMPEInpainter):
         self.device = device
         if device.startswith('cuda') or device == 'mps' or device == 'xpu':
             self.model.to(device)
+        self.execution_devices = ['PyTorch CPU'] if device == 'cpu' else [device]
+        if use_igpu:
+            self._load_openvino()
+
+
 
 
 def relu_nf(x):

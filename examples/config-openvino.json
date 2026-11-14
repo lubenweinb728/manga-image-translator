@@ -1,0 +1,27 @@
+{
+  "upscale": {
+    "upscaler": "4xultrasharp",
+    "upscale_ratio": 2,
+    "revert_upscaling": false
+  },
+  "detector": {
+    "detector": "craft",
+    "detection_size": 2048
+  },
+  "ocr": {
+    "ocr": "48px_ctc"
+  },
+  "translator": {
+    "translator": "papago",
+    "target_lang": "CHS"
+  },
+  "inpainter": {
+    "inpainter": "lama_large",
+    "inpainting_size": 1024,
+    "inpainting_precision": "fp32"
+  },
+  "render": {
+    "renderer": "default",
+    "no_hyphenation": true
+  }
+}

@@ -1,4 +1,7 @@
 import cv2
+import os
+import logging
+import numpy as np
 import copy
 import torch
 import torch.nn as nn
@@ -238,13 +241,74 @@ class TextDetBase(nn.Module):
         return blks[0], mask, lines
 
 class TextDetBaseDNN:
-    def __init__(self, input_size, model_path):
-        self.input_size = input_size
-        self.model = cv2.dnn.readNetFromONNX(model_path)
+    def __init__(self, input_size, model_path, use_igpu=False, logger=None):
+        # CTD is faster on OpenVINO CPU on the tested Gen9 system, including vs GPU FP16.
+        # Keep this module on CPU independently of the device used by other models.
+        device = 'CPU'
+        cache_dir = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+        precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if use_igpu and precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        self.input_size = ((input_size, input_size) if isinstance(input_size, int)
+                           else tuple(input_size))
+        self.model_path = str(model_path)
+        self.model = None
+        self.logger = logger or logging.getLogger(__name__)
+        self.compiled = None
+        self.execution_devices = ['OpenCV CPU']
+        if not use_igpu:
+            self._load_opencv()
+            return
+        try:
+            import openvino as ov
+            core = ov.Core()
+            model = core.read_model(model_path)
+            width, height = self.input_size
+            model.reshape({model.input(0): [1, 3, height, width]})
+            config = {'CACHE_DIR': cache_dir} if cache_dir else {}
+            config['INFERENCE_PRECISION_HINT'] = precision
+            self.compiled = core.compile_model(model, device, config)
+            self.execution_devices = list(self.compiled.get_property('EXECUTION_DEVICES'))
+            self.logger.info('CTD OpenVINO execution devices: %s', self.execution_devices)
+        except Exception as exc:
+            self._fallback(exc)
+
+
+
+    def _load_opencv(self):
+        self.model = cv2.dnn.readNetFromONNX(self.model_path)
         self.uoln = self.model.getUnconnectedOutLayersNames()
 
-    def __call__(self, im_in):
-        blob = cv2.dnn.blobFromImage(im_in, scalefactor=1 / 255.0, size=(self.input_size, self.input_size))
+    def _forward_opencv(self, image):
+        if self.model is None:
+            self._load_opencv()
+        blob = cv2.dnn.blobFromImage(image, scalefactor=1 / 255.0, size=self.input_size)
         self.model.setInput(blob)
-        blks, mask, lines_map  = self.model.forward(self.uoln)
-        return blks, mask, lines_map
+        return self.model.forward(self.uoln)
+
+    def _fallback(self, exc):
+        self.compiled = None
+        self.execution_devices = ['OpenCV CPU']
+        self.logger.warning('CTD OpenVINO failed; using OpenCV CPU: %s', exc)
+
+
+    def __call__(self, image):
+        if self.compiled is not None:
+            try:
+                # Match TextDetBaseDNN exactly: no channel swap, NCHW float32 / 255.
+                blob = cv2.dnn.blobFromImage(
+                    image, scalefactor=1 / 255.0, size=self.input_size)
+                result = self.compiled([blob])
+                outputs = [np.array(result[port], copy=True) for port in self.compiled.outputs]
+                # Identify segmentation outputs by shape rather than exporter names/order.
+                masks = [x for x in outputs if x.ndim == 4 and x.shape[1] == 1]
+                lines = [x for x in outputs if x.ndim == 4 and x.shape[1] == 2]
+                blocks = [x for x in outputs if x.ndim == 3]
+                if len(masks) != 1 or len(lines) != 1 or len(blocks) != 1:
+                    raise ValueError('Unexpected CTD output layout: %s' %
+                                     [x.shape for x in outputs])
+                return blocks[0], masks[0], lines[0]
+            except Exception as exc:
+                # Retry this very image and keep this module on CPU for later pages.
+                self._fallback(exc)
+        return self._forward_opencv(image)

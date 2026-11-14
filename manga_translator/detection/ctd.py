@@ -81,7 +81,19 @@ class ComicTextDetector(OfflineDetector):
             shutil.move('comictextdetector.pt.onnx', self._get_file_path('comictextdetector.pt.onnx'))
         super().__init__(*args, **kwargs)
 
-    async def _load(self, device: str, input_size=1024, half=False, nms_thresh=0.35, conf_thresh=0.4):
+    async def download_onnx(self):
+        # OpenVINO CPU shares the ONNX weights; no PyTorch checkpoint is needed.
+        if not self._check_downloaded_map('model-cpu'):
+            mapping = self._MODEL_MAPPING['model-cpu']
+            path = self._get_file_path('comictextdetector.pt.onnx')
+            await self._download_file(mapping['url'], path)
+            await self._verify_file(mapping['hash'], path)
+        self._downloaded = True
+
+    async def _load(self, device: str, input_size=1024, half=False, nms_thresh=0.35, conf_thresh=0.4, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         self.device = device
         if self.device.startswith('cuda') or self.device == 'mps' or self.device == 'xpu':
             self.model = TextDetBase(self._get_file_path('comictextdetector.pt'), device=self.device, act='leaky')
@@ -89,8 +101,7 @@ class ComicTextDetector(OfflineDetector):
             self.backend = 'torch'
         else:
             model_path = self._get_file_path('comictextdetector.pt.onnx')
-            self.model = cv2.dnn.readNetFromONNX(model_path)
-            self.model = TextDetBaseDNN(input_size, model_path)
+            self.model = TextDetBaseDNN(input_size, model_path, use_igpu=use_igpu, logger=self.logger)
             self.backend = 'opencv'
 
         if isinstance(input_size, int):

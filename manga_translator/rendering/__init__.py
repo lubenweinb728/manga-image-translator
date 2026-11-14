@@ -45,7 +45,7 @@ def count_text_length(text: str) -> float:
             length += 1.0
     return length
 
-def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int):  
+def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int, hyphenate: bool = True):
     """
     Adjust text region size to accommodate font size and translated text length.
     
@@ -99,7 +99,8 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
                 region.translation,
                 max_width=region.unrotated_size[0],
                 max_height=region.unrotated_size[1],
-                language=getattr(region, "target_lang", "en_US")
+                language=getattr(region, "target_lang", "en_US"),
+                hyphenate=hyphenate,
             )
             needed_rows = len(line_text_list)
             # logger.debug(f"Needed rows: {needed_rows}")                
@@ -249,7 +250,7 @@ async def dispatch(
     text_regions = list(filter(lambda region: region.translation, text_regions))
 
     # Resize regions that are too small
-    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
+    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum, hyphenate=hyphenate)
 
     # TODO: Maybe remove intersections
 
@@ -414,7 +415,7 @@ async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, 
         return img_canvas
 
     if not font_path:
-        font_path = os.path.join(BASE_PATH, 'fonts/comic shanns 2.ttf')
+        font_path = text_render.ensure_default_font()
     text_render.set_font(font_path)
 
     return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8,disable_font_border=disable_font_border)
@@ -424,7 +425,7 @@ async def dispatch_eng_render_pillow(img_canvas: np.ndarray, original_img: np.nd
         return img_canvas
 
     if not font_path:
-        font_path = os.path.join(BASE_PATH, 'fonts/NotoSansMonoCJK-VF.ttf.ttc')
+        font_path = text_render.ensure_default_font()
     text_render.set_font(font_path)
 
     return render_textblock_list_eng_pillow(font_path, img_canvas, text_regions, original_img=original_img, downscale_constraint=0.95)

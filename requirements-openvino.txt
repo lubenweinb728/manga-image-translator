@@ -1,0 +1,2 @@
+# Validated runtime for v0.1; install alongside requirements.txt.
+openvino==2026.2.1

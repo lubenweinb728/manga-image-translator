@@ -1,0 +1,8 @@
+{
+  "detector": {
+    "detector": "default"
+  },
+  "ocr": {
+    "ocr": "48px_ctc"
+  }
+}

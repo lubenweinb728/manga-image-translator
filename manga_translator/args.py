@@ -85,6 +85,7 @@ def general_parser(g_parser):
     g_parser.add_argument('--model-dir', default=None, type=dir_path,
                         help='Model directory (by default ./models in project root)')
     g = g_parser.add_mutually_exclusive_group()
+    g.add_argument('--use-igpu', action='store_true', help='Use OpenVINO for supported models (CTD/Paddle detection and LaMa Large use CPU FP32; MC2 defaults to CPU FP32); unsupported stages retain their original runtimes')
     g.add_argument('--use-gpu', action='store_true', help='Turn on/off gpu (auto switch between mps and cuda)')
     g.add_argument('--use-gpu-limited', action='store_true', help='Turn on/off gpu (excluding offline translator)')
     g_parser.add_argument('--font-path', default='', type=file_path, help='Path to font file')
@@ -107,6 +108,9 @@ def reparse(arr: list):
                                      description='Seamlessly translate mangas into a chosen language',
                                      formatter_class=HelpFormatter)
     general_parser(p)
+    # Only explicitly supplied trailing options should override the main parser.
+    for action in p._actions:
+        action.default = argparse.SUPPRESS
     return p.parse_args(arr)
 
 parser = argparse.ArgumentParser(prog='manga_translator', description='Seamlessly translate mangas into a chosen language', formatter_class=HelpFormatter)

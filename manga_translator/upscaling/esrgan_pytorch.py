@@ -518,35 +518,128 @@ class ESRGANUpscalerPytorch(OfflineUpscaler):
     }
     _VALID_UPSCALE_RATIOS = [2, 3, 4]
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         super().__init__()
         os.makedirs(self.model_dir, exist_ok=True)
         if os.path.exists('4xESRGAN.pth'):
             shutil.move('4xESRGAN.pth', self._get_file_path('4xESRGAN.pth'))
-        sd = torch.load(self._get_file_path('4xESRGAN.pth'))
+        sd = torch.load(self._get_file_path('4xESRGAN.pth'), map_location='cpu')
         in_nc, out_nc, nf, nb, plus, mscale = infer_params(sd)
         self.model = RRDBNet(in_nc=in_nc, out_nc=out_nc, nf=nf, nb=nb, upscale=mscale, plus=plus)
         self.model.load_state_dict(sd)
         self.model.eval()
         self.model = self.model.to(device)
         self.device = device
+        self.scale = mscale
+        self.execution_devices = ['PyTorch CPU'] if device == 'cpu' else [device]
+        if use_igpu:
+            self._load_openvino()
 
     async def _unload(self):
-        pass
+        if getattr(self, 'use_igpu', False):
+            self.compiled_tiles.clear()
+            self.ov_model = None
+            self.core = None
+        del self.model
+
+    def _load_openvino(self):
+        self.ov_device = os.environ.get('MANGA_OPENVINO_DEVICE', 'GPU')
+        self.precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if self.precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        self.tile_size, self.tile_pad = 128, 32
+        self.compiled_tiles = OrderedDict()
+        self.ov_model = None
+        try:
+            import openvino as ov
+            self.core = ov.Core()
+            with torch.inference_mode():
+                self.ov_model = ov.convert_model(self.model,
+                    example_input=torch.zeros(1, 3, 32, 32), input=[1, 3, -1, -1])
+        except Exception as exc:
+            self._fallback_openvino(exc)
+
+    def _fallback_openvino(self, exc):
+        self.ov_model = None
+        self.compiled_tiles.clear()
+        self.execution_devices = ['PyTorch CPU']
+        self.logger.warning('4xUltraSharp OpenVINO failed; using PyTorch CPU: %s', exc)
+
+    def _forward_tile(self, tile):
+        if self.ov_model is None:
+            return self.model(tile)
+        shape = tuple(tile.shape)
+        if shape not in self.compiled_tiles:
+            model = self.ov_model.clone()
+            model.reshape({model.input(0): list(shape)})
+            config = {'INFERENCE_PRECISION_HINT': self.precision}
+            cache = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+            if cache:
+                config['CACHE_DIR'] = cache
+            if len(self.compiled_tiles) >= 4:
+                self.compiled_tiles.popitem(last=False)
+            compiled = self.core.compile_model(model, self.ov_device, config)
+            self.compiled_tiles[shape] = compiled
+            self.execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+            self.logger.info('4xUltraSharp OpenVINO tile %s execution devices: %s', shape, self.execution_devices)
+        self.compiled_tiles.move_to_end(shape)
+        compiled = self.compiled_tiles[shape]
+        result = compiled([np.ascontiguousarray(tile.detach().cpu().numpy())])
+        if len(compiled.outputs) != 1:
+            raise ValueError('Unexpected 4xUltraSharp output count')
+        output = np.array(result[compiled.output(0)], copy=True)
+        expected = (1, 3, shape[2] * self.scale, shape[3] * self.scale)
+        if output.shape != expected or not np.isfinite(output).all():
+            raise ValueError('Unexpected 4xUltraSharp output layout or nonfinite values')
+        return torch.from_numpy(output)
+
+    def _forward_tiled(self, image):
+        _, channels, height, width = image.shape
+        scale, size, pad = self.scale, self.tile_size, self.tile_pad
+        output = torch.empty((1, channels, height * scale, width * scale), dtype=torch.float32)
+        for y in range(0, height, size):
+            for x in range(0, width, size):
+                bottom, right = min(y + size, height), min(x + size, width)
+                top_pad, left_pad = max(0, y - pad), max(0, x - pad)
+                bottom_pad, right_pad = min(height, bottom + pad), min(width, right + pad)
+                tile = image[:, :, top_pad:bottom_pad, left_pad:right_pad]
+                result = self._forward_tile(tile)
+                crop_y, crop_x = (y - top_pad) * scale, (x - left_pad) * scale
+                output[:, :, y * scale:bottom * scale, x * scale:right * scale] = result[
+                    :, :, crop_y:crop_y + (bottom - y) * scale, crop_x:crop_x + (right - x) * scale]
+        return output
+
+    def _forward(self, batch):
+        if not getattr(self, 'use_igpu', False):
+            return self.model(batch)
+        try:
+            return self._forward_tiled(batch)
+        except Exception as exc:
+            if self.ov_model is None:
+                raise
+            self._fallback_openvino(exc)
+            # Discard partially completed tiles and retry this whole image on CPU.
+            return self._forward_tiled(batch)
 
     async def _infer(self, image_batch: List[Image.Image], upscale_ratio: float) -> List[Image.Image]:
         assert upscale_ratio <= 4
         ratio = upscale_ratio / 4
-        if image_batch :
-            batch = torch.cat([einops.rearrange(torch.from_numpy(np.array(img.convert('RGB'))[:,:,::-1].copy()).float() / 255.0, 'h w c -> 1 c h w') for img in image_batch], dim = 0).to(self.device)
+        results = []
+        batches = [[image] for image in image_batch] if getattr(self, 'use_igpu', False) else [image_batch]
+        for images in batches:
+            if not images:
+                continue
+            batch = torch.cat([einops.rearrange(torch.from_numpy(np.array(img.convert('RGB'))[:,:,::-1].copy()).float() / 255.0, 'h w c -> 1 c h w') for img in images], dim = 0).to(self.device)
             with torch.no_grad() :
-                ret = self.model(batch)
+                ret = self._forward(batch)
             ret: torch.Tensor
             ret: List[Image.Image] = [Image.fromarray((einops.rearrange(img.clip(0, 1), 'c h w -> h w c').cpu().numpy()[:,:,::-1].copy() * 255.0).astype(np.uint8)) for img in ret]
             ret = [img.resize(size = (int(round(img.size[0] * ratio)), int(round(img.size[1] * ratio))), resample = Image.Resampling.BILINEAR) for img in ret]
-            return ret
-        else :
-            return []
+            results.extend(ret)
+        return results
 
 def test() :
     sd = torch.load('../../models/upscaling/esrgan-pytorch/4xESRGAN.pth')

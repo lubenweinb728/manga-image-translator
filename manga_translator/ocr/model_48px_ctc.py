@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 import math
 import shutil
 import cv2
@@ -35,7 +36,10 @@ class Model48pxCTCOCR(OfflineOCR):
             shutil.move('alphabet-all-v5.txt', self._get_file_path('alphabet-all-v5.txt'))
         super().__init__(*args, **kwargs)
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         with open(self._get_file_path('alphabet-all-v5.txt'), 'r', encoding = 'utf-8') as fp:
             dictionary = [s[:-1] for s in fp.readlines()]
 
@@ -48,6 +52,7 @@ class Model48pxCTCOCR(OfflineOCR):
         self.model.load_state_dict(sd, strict = False)
         self.model.eval()
         self.device = device
+        self.execution_devices = ['PyTorch CPU'] if device == 'cpu' else [device]
         if (device.startswith('cuda') or device == 'mps' or device == 'xpu'):
             self.use_gpu = True
         else:
@@ -56,8 +61,84 @@ class Model48pxCTCOCR(OfflineOCR):
             self.model = self.model.to(device)
 
     
+        if use_igpu:
+            self._load_openvino()
+
+    def _decode(self, images, widths, verbose=False):
+        if getattr(self, 'use_igpu', False):
+            logits, colors = self._forward_openvino(images)
+            return self.model.decode_ctc_top1(logits, colors, 0, verbose=verbose)
+        return self.model.decode(images, widths, 0, verbose=verbose)
+
     async def _unload(self):
+        if getattr(self, 'use_igpu', False):
+            self.compiled_widths.clear()
+            self.ov_model = None
+            self.core = None
         del self.model
+
+    def _load_openvino(self):
+        self.ov_device = os.environ.get('MANGA_OPENVINO_DEVICE', 'GPU')
+        self.precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if self.precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        self.ov_model = None
+        self.compiled_widths = OrderedDict()
+        self.execution_devices = ['PyTorch CPU']
+        try:
+            import openvino as ov
+            self.core = ov.Core()
+            with torch.inference_mode():
+                self.ov_model = ov.convert_model(
+                    self.model, example_input=torch.zeros(1, 3, 48, 160),
+                    input=[1, 3, 48, -1])
+        except Exception as exc:
+            self._fallback_openvino(exc)
+
+    def _fallback_openvino(self, exc):
+        self.ov_model = None
+        self.compiled_widths.clear()
+        self.execution_devices = ['PyTorch CPU']
+        self.logger.warning('CTC OCR OpenVINO failed; using PyTorch CPU: %s', exc)
+
+    def _forward_openvino(self, images):
+        if self.ov_model is None:
+            return self.model(images.cpu())
+        try:
+            width = images.shape[-1]
+            if width not in self.compiled_widths:
+                model = self.ov_model.clone()
+                model.reshape({model.input(0): [1, 3, 48, width]})
+                config = {'INFERENCE_PRECISION_HINT': self.precision}
+                cache = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+                if cache:
+                    config['CACHE_DIR'] = cache
+                if len(self.compiled_widths) >= 4:
+                    self.compiled_widths.popitem(last=False)
+                compiled = self.core.compile_model(model, self.ov_device, config)
+                self.compiled_widths[width] = compiled
+                self.execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+                self.logger.info('CTC OCR OpenVINO width %s execution devices: %s',
+                                 width, self.execution_devices)
+            self.compiled_widths.move_to_end(width)
+            compiled = self.compiled_widths[width]
+            inputs = images.detach().cpu().numpy()
+            outputs = []
+            for sample in inputs:
+                result = compiled([np.ascontiguousarray(sample[None])])
+                values = [np.array(result[p], copy=True) for p in compiled.outputs]
+                if (len(values) != 2 or any(x.ndim != 3 or x.shape[0] != 1 for x in values)
+                        or values[0].shape[2] != self.model.dict_size
+                        or values[1].shape[2] != 6 or values[0].shape[1] != values[1].shape[1]):
+                    raise ValueError('Unexpected CTC OCR output layout')
+                outputs.append(values)
+            return tuple(torch.from_numpy(np.concatenate([x[i] for x in outputs], 0))
+                         for i in (0, 1))
+        except Exception as exc:
+            # Retry the entire batch, including samples completed before a GPU failure.
+            self._fallback_openvino(exc)
+            return self.model(images.cpu())
+
 
     async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False) -> List[TextBlock]:
         text_height = 48
@@ -103,7 +184,7 @@ class Model48pxCTCOCR(OfflineOCR):
             if self.use_gpu:
                 images = images.to(self.device)
             with torch.inference_mode():
-                texts = self.model.decode(images, widths, 0, verbose = verbose)
+                texts = self._decode(images, widths, verbose=verbose)
             for i, single_line in enumerate(texts):
                 if not single_line:
                     continue

@@ -130,7 +130,10 @@ class CRAFTDetector(OfflineDetector):
             shutil.move('craft_refiner_CTW1500.pth', self._get_file_path('craft_refiner_CTW1500.pth'))
         super().__init__(*args, **kwargs)
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         self.model = CRAFT()
         self.model.load_state_dict(copyStateDict(torch.load(self._get_file_path('craft_mlt_25k.pth'), map_location='cpu')))
         self.model.eval()
@@ -141,11 +144,83 @@ class CRAFTDetector(OfflineDetector):
         if device.startswith('cuda') or device == 'mps' or device == 'xpu':
             self.model = self.model.to(self.device)
             self.model_refiner = self.model_refiner.to(self.device)
-        global MODEL
-        MODEL = self.model
+        self.execution_devices = ['PyTorch CPU'] if device == 'cpu' else [device]
+        if use_igpu:
+            self._load_openvino()
 
     async def _unload(self):
+        if getattr(self, 'use_igpu', False):
+            self.compiled_shapes.clear()
+            self.ov_model = None
+            self.core = None
         del self.model
+        del self.model_refiner
+
+    def _load_openvino(self):
+        self.ov_device = os.environ.get('MANGA_OPENVINO_DEVICE', 'GPU')
+        self.precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if self.precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        self.compiled_shapes = OrderedDict()
+        self.ov_model = None
+        try:
+            import openvino as ov
+
+            class DetectionWithRefiner(nn.Module):
+                def __init__(self, detector, refiner):
+                    super().__init__()
+                    self.detector, self.refiner = detector, refiner
+
+                def forward(self, image):
+                    scores, features = self.detector(image)
+                    return scores, self.refiner(scores, features)
+
+            self.core = ov.Core()
+            network = DetectionWithRefiner(self.model, self.model_refiner).eval()
+            with torch.inference_mode():
+                self.ov_model = ov.convert_model(network,
+                    example_input=torch.zeros(1, 3, 64, 64), input=[1, 3, -1, -1])
+        except Exception as exc:
+            self._fallback_openvino(exc)
+
+    def _fallback_openvino(self, exc):
+        self.ov_model = None
+        self.compiled_shapes.clear()
+        self.execution_devices = ['PyTorch CPU']
+        self.logger.warning('CRAFT OpenVINO failed; using PyTorch CPU: %s', exc)
+
+    def _forward(self, image):
+        if getattr(self, 'use_igpu', False) and self.ov_model is not None:
+            try:
+                shape = tuple(image.shape)
+                if shape not in self.compiled_shapes:
+                    model = self.ov_model.clone()
+                    model.reshape({model.input(0): list(shape)})
+                    config = {'INFERENCE_PRECISION_HINT': self.precision}
+                    cache = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+                    if cache:
+                        config['CACHE_DIR'] = cache
+                    if len(self.compiled_shapes) >= 2:
+                        self.compiled_shapes.popitem(last=False)
+                    compiled = self.core.compile_model(model, self.ov_device, config)
+                    self.compiled_shapes[shape] = compiled
+                    self.execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+                    self.logger.info('CRAFT OpenVINO shape %s execution devices: %s', shape, self.execution_devices)
+                self.compiled_shapes.move_to_end(shape)
+                compiled = self.compiled_shapes[shape]
+                result = compiled([np.ascontiguousarray(image.detach().cpu().numpy())])
+                values = [np.array(result[p], copy=True) for p in compiled.outputs]
+                expected = (shape[0], shape[2] // 2, shape[3] // 2)
+                if (len(values) != 2 or values[0].shape != (*expected, 2)
+                        or values[1].shape != (*expected, 1)
+                        or not all(np.isfinite(v).all() for v in values)):
+                    raise ValueError('Unexpected CRAFT output layout or nonfinite values')
+                return tuple(torch.from_numpy(v) for v in values)
+            except Exception as exc:
+                self._fallback_openvino(exc)
+        with torch.no_grad():
+            scores, features = self.model(image)
+            return scores, self.model_refiner(scores, features)
 
     async def _infer(self, image: np.ndarray, detect_size: int, text_threshold: float, box_threshold: float,
                      unclip_ratio: float, verbose: bool = False):
@@ -158,15 +233,13 @@ class CRAFTDetector(OfflineDetector):
         x = torch.from_numpy(x).permute(2, 0, 1)    # [h, w, c] to [c, h, w]
         x = x.unsqueeze(0).to(self.device)                # [c, h, w] to [b, c, h, w]
 
-        with torch.no_grad() :
-            y, feature = self.model(x)
+        y, y_refiner = self._forward(x)
 
         # make score and link map
         score_text = y[0,:,:,0].cpu().data.numpy()
         score_link = y[0,:,:,1].cpu().data.numpy()
 
         # refine link
-        y_refiner = self.model_refiner(y, feature)
         score_link = y_refiner[0,:,:,0].cpu().data.numpy()
 
         # Post-processing
@@ -185,7 +258,7 @@ class CRAFTDetector(OfflineDetector):
         
         polys_ret = []
         for i in range(len(polys)) :
-            poly = MultiPoint(polys[i])
+            poly = Polygon(polys[i])
             if poly.area > 10 :
                 rect = poly.minimum_rotated_rectangle
                 rect = affinity.scale(rect, xfact = 1.2, yfact = 1.2)

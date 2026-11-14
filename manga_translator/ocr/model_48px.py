@@ -1,7 +1,7 @@
 
 import math
 from typing import Callable, List, Optional, Tuple, Union
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import os
 import shutil
 import cv2
@@ -44,15 +44,19 @@ class Model48pxOCR(OfflineOCR):
             shutil.move('alphabet-all-v7.txt', self._get_file_path('alphabet-all-v7.txt'))
         super().__init__(*args, **kwargs)
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = 'cpu'
         with open(self._get_file_path('alphabet-all-v7.txt'), 'r', encoding = 'utf-8') as fp:
             dictionary = [s[:-1] for s in fp.readlines()]
 
         self.model = OCR(dictionary, 768)
-        sd = torch.load(self._get_file_path('ocr_ar_48px.ckpt'))
+        sd = torch.load(self._get_file_path('ocr_ar_48px.ckpt'), map_location='cpu')
         self.model.load_state_dict(sd)
         self.model.eval()
         self.device = device
+        self.execution_devices = ['PyTorch CPU'] if device == 'cpu' else [device]
         if (device.startswith('cuda') or device == 'mps' or device == 'xpu'):
             self.use_gpu = True
         else:
@@ -61,9 +65,96 @@ class Model48pxOCR(OfflineOCR):
             self.model = self.model.to(device)
 
 
+        if use_igpu:
+            self._load_openvino()
+
     async def _unload(self):
+        if getattr(self, 'use_igpu', False):
+            self.ov_compiled.clear()
+            self.ov_encoder = self.ov_decoder = self.ov_core = None
+            self.model._ov_encode = self.model._ov_step = None
         del self.model
     
+    def _load_openvino(self):
+        self.ov_device = os.environ.get('MANGA_OPENVINO_DEVICE', 'GPU')
+        self.ov_precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if self.ov_precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        self.ov_compiled = OrderedDict()
+        self.ov_encoder = self.ov_decoder = None
+        try:
+            import openvino as ov
+            self.ov_core = ov.Core()
+            with torch.no_grad():
+                self.ov_encoder = ov.convert_model(AR48Encoder(self.model).eval(),
+                    example_input=(torch.zeros(1, 3, 48, 160), torch.tensor([144])),
+                    input=[ov.PartialShape([-1, 3, 48, -1]), ov.PartialShape([-1])])
+                self.ov_decoder = ov.convert_model(AR48DecoderStep(self.model).eval(),
+                    example_input=(torch.ones(1, 1, dtype=torch.long),
+                                   torch.zeros(1, 6, 1, 320), torch.zeros(1, 42, 320),
+                                   torch.zeros(1, 42, dtype=torch.bool)),
+                    input=[ov.PartialShape([-1, 1]), ov.PartialShape([-1, 6, -1, 320]),
+                           ov.PartialShape([-1, -1, 320]), ov.PartialShape([-1, -1])])
+            self.model._ov_encode = self._encode_openvino
+            self.model._ov_step = self._step_openvino
+        except Exception as exc:
+            self._fallback_openvino(exc)
+
+    def _fallback_openvino(self, exc):
+        self.ov_encoder = self.ov_decoder = None
+        self.ov_compiled.clear()
+        self.model._ov_encode = self.model._ov_step = None
+        self.execution_devices = ['PyTorch CPU']
+        self.logger.warning('48px OpenVINO failed; using PyTorch CPU: %s', exc)
+
+    def _compile_openvino(self, key, model):
+        if key not in self.ov_compiled:
+            config = {'INFERENCE_PRECISION_HINT': self.ov_precision}
+            cache = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+            if cache:
+                config['CACHE_DIR'] = cache
+            compiled = self.ov_core.compile_model(model, self.ov_device, config)
+            self.ov_compiled[key] = compiled
+            self.execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+            self.logger.info('48px OpenVINO %s execution devices: %s', key, self.execution_devices)
+            # One decoder graph and up to four image shapes.
+            encoders = [k for k in self.ov_compiled if k[0] == 'encoder']
+            if len(encoders) > 4:
+                del self.ov_compiled[encoders[0]]
+        self.ov_compiled.move_to_end(key)
+        return self.ov_compiled[key]
+
+    def _encode_openvino(self, images, widths):
+        shape = tuple(images.shape)
+        key = ('encoder', shape)
+        if key not in self.ov_compiled:
+            model = self.ov_encoder.clone()
+            model.reshape({model.input(0): list(shape), model.input(1): [shape[0]]})
+        else:
+            model = None
+        compiled = self._compile_openvino(key, model)
+        result = compiled([images.detach().cpu().numpy(), np.asarray(widths, dtype=np.int64)])
+        return tuple(torch.from_numpy(np.array(result[p], copy=True)) for p in compiled.outputs)
+
+    def _step_openvino(self, tokens, cached, memory, mask, step):
+        compiled = self._compile_openvino(('decoder',), self.ov_decoder)
+        result = compiled([tokens.detach().cpu().numpy(),
+                           cached[:, :, :step, :].detach().cpu().contiguous().numpy(),
+                           memory.detach().cpu().numpy(), mask.detach().cpu().numpy()])
+        logits, updated = [torch.from_numpy(np.array(result[p], copy=True)) for p in compiled.outputs]
+        cached[:, :, :step+1, :] = updated
+        return logits.log_softmax(-1), cached
+
+    def _infer_beam(self, images, widths):
+        try:
+            return self.model.infer_beam_batch_tensor(images, widths, beams_k=5, max_seq_length=255)
+        except Exception as exc:
+            if not getattr(self, 'use_igpu', False) or self.ov_encoder is None:
+                raise
+            self._fallback_openvino(exc)
+            # Restart the full batch; never continue from a partially updated decoder cache.
+            return self.model.infer_beam_batch_tensor(images.cpu(), widths, beams_k=5, max_seq_length=255)
+
     async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, ignore_bubble: int = 0) -> List[TextBlock]:
         text_height = 48
         max_chunk_size = 16
@@ -117,7 +208,7 @@ class Model48pxOCR(OfflineOCR):
             if self.use_gpu:
                 image_tensor = image_tensor.to(self.device)
             with torch.no_grad():
-                ret = self.model.infer_beam_batch_tensor(image_tensor, widths, beams_k = 5, max_seq_length = 255)
+                ret = self._infer_beam(image_tensor, widths)
             for i, (pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred) in enumerate(ret):
                 if prob < threshold:
                     continue
@@ -178,6 +269,71 @@ class Model48pxOCR(OfflineOCR):
         if is_quadrilaterals:
             return out_regions
         return textlines
+
+
+class AR48Encoder(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, image, widths):
+        memory = self.model.backbone(image).squeeze(2).transpose(1, 2)
+        mask = torch.arange(memory.shape[1], device=image.device)[None, :] >= ((widths + 3) // 4 + 2)[:, None]
+        return self.model.encoders(memory, mask), mask
+
+
+def ar48_rotary(attention, value, offset, downscale):
+    # Equivalent to XPOS, without the Python shape branch: offset may be dynamic.
+    length = value.shape[1]
+    positions = torch.arange(offset, offset + length, device=value.device)
+    # Use positive integer division: some frontends truncate negative division.
+    minimum = -((length + offset + 1) // 2)
+    scale = attention.xpos.scale ** ((positions + minimum).to(value.dtype)[:, None] / attention.xpos.scale_base)
+    frequency = 1.0 / (10000 ** (torch.arange(0, value.shape[2] // 2, device=value.device).float() / (value.shape[2] // 2)))
+    angles = positions.float()[:, None] * frequency[None, :]
+    if downscale:
+        scale = 1 / scale
+    sin = (angles.sin().to(value.dtype) * scale).repeat_interleave(2, -1)
+    cos = (angles.cos().to(value.dtype) * scale).repeat_interleave(2, -1)
+    rotated = torch.stack((-value[:, :, 1::2], value[:, :, ::2]), -1).flatten(-2)
+    return value * cos + rotated * sin
+
+
+def ar48_attention(attention, query, key, mask=None, offset=0):
+    batch, length, channels = query.shape
+    source = key.shape[1]
+    heads, dim = attention.num_heads, attention.head_dim
+    q = (attention.q_proj(query) * attention.scaling).reshape(batch, length, heads, dim).transpose(1, 2).reshape(-1, length, dim)
+    k = attention.k_proj(key).reshape(batch, source, heads, dim).transpose(1, 2).reshape(-1, source, dim)
+    v = attention.v_proj(key).reshape(batch, source, heads, dim).transpose(1, 2).reshape(-1, source, dim)
+    q = ar48_rotary(attention, q, offset, False)
+    k = ar48_rotary(attention, k, 0, True)
+    weights = torch.bmm(q, k.transpose(1, 2)).reshape(batch, heads, length, source)
+    if mask is not None:
+        weights = weights.masked_fill(mask[:, None, None, :], float('-inf'))
+    weights = weights.reshape(-1, length, source).softmax(-1, dtype=torch.float32).to(q.dtype)
+    output = torch.bmm(weights, v).transpose(0, 1).reshape(length, batch, channels).transpose(0, 1)
+    return attention.out_proj(output)
+
+
+class AR48DecoderStep(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, tokens, cached, memory, mask):
+        step = cached.shape[2]
+        target = self.model.embd(tokens)
+        updated = []
+        for index, layer in enumerate(self.model.decoders):
+            combined = torch.cat([cached[:, index], target], 1)
+            updated.append(combined)
+            target = target + ar48_attention(layer.self_attn, layer.norm1(target), layer.norm1(combined), offset=step)
+            normalized = layer.norm2(target)
+            target = target + ar48_attention(layer.multihead_attn, normalized, memory, mask, step)
+            target = target + layer._ff_block(layer.norm3(target))
+        updated.append(torch.cat([cached[:, len(self.model.decoders)], target], 1))
+        return self.model.pred(self.model.pred1(target.squeeze(1))), torch.stack(updated, 1)
 
 class ConvNeXtBlock(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
@@ -679,22 +835,28 @@ class OCR(nn.Module):
         N, C, H, W = img.shape
         assert H == 48 and C == 3
 
-        memory = self.backbone(img)
-        memory = einops.rearrange(memory, 'N C 1 W -> N W C')
-        valid_feats_length = [(x + 3) // 4 + 2 for x in img_widths]
-        input_mask = torch.zeros(N, memory.size(1), dtype = torch.bool).to(img.device)
+        if getattr(self, '_ov_encode', None):
+            memory, input_mask = self._ov_encode(img, img_widths)
+        else:
+            memory = self.backbone(img)
+            memory = einops.rearrange(memory, 'N C 1 W -> N W C')
+            valid_feats_length = [(x + 3) // 4 + 2 for x in img_widths]
+            input_mask = torch.zeros(N, memory.size(1), dtype = torch.bool).to(img.device)
         
-        for i, l in enumerate(valid_feats_length):
-            input_mask[i, l:] = True
-        memory = self.encoders(memory, input_mask) # N, W, Dim
+            for i, l in enumerate(valid_feats_length):
+                input_mask[i, l:] = True
+            memory = self.encoders(memory, input_mask) # N, W, Dim
 
         out_idx = torch.full((N, 1), start_tok, dtype=torch.long, device=img.device)  # Shape [N, 1]
         cached_activations = torch.zeros(N, len(self.decoders)+1, max_seq_length, 320, device=img.device)  # [N, L, S, E]
         log_probs = torch.zeros(N, 1, device=img.device)  # Shape [N, 1]        # N, E
         idx_embedded = self.embd(out_idx[:, -1:]) 
 
-        decoded, cached_activations = self.decoders(idx_embedded, cached_activations, memory, input_mask, 0)
-        pred_char_logprob = self.pred(self.pred1(decoded)).log_softmax(-1)   # N, n_chars
+        if getattr(self, '_ov_step', None):
+            pred_char_logprob, cached_activations = self._ov_step(out_idx[:, -1:], cached_activations, memory, input_mask, 0)
+        else:
+            decoded, cached_activations = self.decoders(idx_embedded, cached_activations, memory, input_mask, 0)
+            pred_char_logprob = self.pred(self.pred1(decoded)).log_softmax(-1)
         pred_chars_values, pred_chars_index = torch.topk(pred_char_logprob, beams_k, dim = 1)  # N, k
 
         out_idx = torch.cat([out_idx.unsqueeze(1).expand(-1, beams_k, -1), pred_chars_index.unsqueeze(-1)], dim=-1).reshape(-1, 2)  # Shape [N * k, 2]
@@ -709,8 +871,11 @@ class OCR(nn.Module):
 
         for step in range(1, max_seq_length):
             idx_embedded = self.embd(out_idx[:, -1:])
-            decoded, cached_activations = self.decoders(idx_embedded, cached_activations, memory, input_mask, step)
-            pred_char_logprob = self.pred(self.pred1(decoded)).log_softmax(-1)  # Shape [N * k, dict_size]
+            if getattr(self, '_ov_step', None):
+                pred_char_logprob, cached_activations = self._ov_step(out_idx[:, -1:], cached_activations, memory, input_mask, step)
+            else:
+                decoded, cached_activations = self.decoders(idx_embedded, cached_activations, memory, input_mask, step)
+                pred_char_logprob = self.pred(self.pred1(decoded)).log_softmax(-1)
             pred_chars_values, pred_chars_index = torch.topk(pred_char_logprob, beams_k, dim=1)  # [N * k, k]
 
             finished = out_idx[:, -1] == end_tok

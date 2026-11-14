@@ -1,12 +1,7 @@
 
 # -*- coding: utf-8 -*-
-from functools import cached_property
-import uuid
-import hmac, base64
-import aiohttp
-import time
+import asyncio
 import requests
-import re
 
 from .common import CommonTranslator, InvalidServerResponse
 
@@ -27,39 +22,46 @@ class PapagoTranslator(CommonTranslator):
         'THA': 'th',
         'IND': 'id'
     }
-    _API_URL = 'https://papago.naver.com/apis/n2mt/translate'
+    _HOME_URL = 'https://papago.naver.com/'
+    _API_URL = 'https://papago.naver.com/api/text/translation'
 
     async def _translate(self, from_lang, to_lang, queries):
+        if not queries:
+            return []
         data = {}
         data['honorific'] = "false"
         data['source'] = from_lang
         data['target'] = to_lang
         data['text'] = '\n'.join(queries)
-        result = await self._do_request(data, self._version_key)
-        if "translatedText" not in result:
-            raise InvalidServerResponse(f'Papago returned invalid response: {result}\nAre the API keys set correctly?')
+        data['dict'] = 'false'
+        data['useGlossary'] = 'false'
+        result = await self._do_request(data)
+        if not isinstance(result, dict) or not isinstance(result.get('translatedText'), str):
+            raise InvalidServerResponse('Papago response is missing translatedText; the web API may have changed.')
         result_list = [str.strip() for str in result["translatedText"].split("\n")]
         return result_list
 
-    @cached_property
-    def _version_key(self):
-        script = requests.get('https://papago.naver.com')
-        mainJs = re.search(r'\/(main.*\.js)', script.text).group(1)
-        papagoVerData = requests.get('https://papago.naver.com/' + mainJs)
-        papagoVer = re.search(r'"PPG .*,"(v[^"]*)', papagoVerData.text).group(1)
-        return papagoVer
+    async def _do_request(self, data):
+        # requests also honors Windows system proxies. Run it off the event loop.
+        return await asyncio.to_thread(self._request_sync, data)
 
-    async def _do_request(self, data, version_key):
-        guid = uuid.uuid4()
-        timestamp = int(time.time() * 1000)
-        key = version_key.encode("utf-8")
-        code = f"{guid}\n{self._API_URL}\n{timestamp}".encode("utf-8")
-        token = base64.b64encode(hmac.new(key, code, "MD5").digest()).decode("utf-8")
+    def _request_sync(self, data):
         headers = {
-            "Authorization": f"PPG {guid}:{token}",
+            "User-Agent": "Mozilla/5.0",
+            "Referer": self._HOME_URL,
+            "Origin": self._HOME_URL.rstrip('/'),
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Timestamp": str(timestamp),
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self._API_URL, data=data, headers=headers) as resp:
-                return await resp.json()
+        with requests.Session() as session:
+            session.headers.update(headers)
+            # Establish the same session cookies as the current web client.
+            with session.get(self._HOME_URL, timeout=30) as resp:
+                if resp.status_code != 200:
+                    raise InvalidServerResponse(f'Papago homepage returned HTTP {resp.status_code}.')
+            with session.post(self._API_URL, data=data, timeout=30) as resp:
+                if resp.status_code != 200:
+                    raise InvalidServerResponse(f'Papago translation returned HTTP {resp.status_code}.')
+                try:
+                    return resp.json()
+                except ValueError as exc:
+                    raise InvalidServerResponse('Papago returned a non-JSON response.') from exc

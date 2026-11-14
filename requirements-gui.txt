@@ -1,0 +1,2 @@
+# Optional desktop interface; install alongside requirements.txt.
+PySide6==6.12.0

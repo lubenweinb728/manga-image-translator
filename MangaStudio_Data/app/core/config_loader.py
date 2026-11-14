@@ -23,12 +23,7 @@ class ConfigLoader:
         self.full_config_data = self._build_full_config_data()
 
     def _find_python_executable(self):
-        venv_path_win = os.path.join(self.project_base_dir, 'venv', 'Scripts', 'python.exe')
-        venv_path_unix = os.path.join(self.project_base_dir, 'venv', 'bin', 'python')
-        if os.path.exists(venv_path_win):
-            return venv_path_win
-        elif os.path.exists(venv_path_unix):
-            return venv_path_unix
+        # Backend and desktop UI must use the same configured environment.
         return sys.executable
 
     def _load_backend_schema(self):

@@ -284,6 +284,9 @@ class MangaTranslator:
             # 自动禁用并发模式
             self.batch_concurrent = False
             
+        self.use_igpu = params.get('use_igpu', False)
+        if self.use_igpu and (params.get('use_gpu', False) or params.get('use_gpu_limited', False)):
+            raise ValueError('--use-igpu cannot be combined with --use-gpu or --use-gpu-limited')
         self.ignore_errors = params.get('ignore_errors', False)
         # check xpu for intel arc, mps for apple silicon, or cuda for nvidia
         device = 'xpu' if torch.xpu.is_available() else ('mps' if torch.backends.mps.is_available() else 'cuda')
@@ -404,9 +407,9 @@ class MangaTranslator:
             logger.info('Loading models')
             if config.upscale.upscale_ratio:
                 await prepare_upscaling(config.upscale.upscaler)
-            await prepare_detection(config.detector.detector)
-            await prepare_ocr(config.ocr.ocr, self.device)
-            await prepare_inpainting(config.inpainter.inpainter, self.device)
+            await prepare_detection(config.detector.detector, use_igpu=self.use_igpu)
+            await prepare_ocr(config.ocr.ocr, self.device, use_igpu=self.use_igpu)
+            await prepare_inpainting(config.inpainter.inpainter, self.device, use_igpu=self.use_igpu)
             await prepare_translation(config.translator.translator_gen)
             if config.colorizer.colorizer != Colorizer.none:
                 await prepare_colorization(config.colorizer.colorizer)
@@ -673,6 +676,7 @@ class MangaTranslator:
             colorization_size=config.colorizer.colorization_size,
             denoise_sigma=config.colorizer.denoise_sigma,
             device=self.device,
+            use_igpu=self.use_igpu,
             image=ctx.input,
             **ctx
         )
@@ -680,7 +684,7 @@ class MangaTranslator:
     async def _run_upscaling(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("upscaling", config.upscale.upscaler)] = current_time
-        return (await dispatch_upscaling(config.upscale.upscaler, [ctx.img_colorized], config.upscale.upscale_ratio, self.device))[0]
+        return (await dispatch_upscaling(config.upscale.upscaler, [ctx.img_colorized], config.upscale.upscale_ratio, self.device, use_igpu=self.use_igpu))[0]
 
     async def _run_detection(self, config: Config, ctx: Context):
         current_time = time.time()
@@ -689,7 +693,7 @@ class MangaTranslator:
                                         config.detector.box_threshold,
                                         config.detector.unclip_ratio, config.detector.det_invert, config.detector.det_gamma_correct, config.detector.det_rotate,
                                         config.detector.det_auto_rotate,
-                                        self.device, self.verbose)        
+                                        self.device, self.verbose, use_igpu=self.use_igpu)
         return result
 
     async def _unload_model(self, tool: str, model: str):
@@ -751,7 +755,7 @@ class MangaTranslator:
             os.environ['MANGA_OCR_RESULT_DIR'] = ocr_result_dir
         
         try:
-            textlines = await dispatch_ocr(config.ocr.ocr, ctx.img_rgb, ctx.textlines, config.ocr, self.device, self.verbose)
+            textlines = await dispatch_ocr(config.ocr.ocr, ctx.img_rgb, ctx.textlines, config.ocr, self.device, self.verbose, use_igpu=self.use_igpu)
         finally:
             # 恢复环境变量
             if old_ocr_dir is not None:
@@ -1361,7 +1365,7 @@ class MangaTranslator:
         current_time = time.time()
         self._model_usage_timestamps[("inpainting", config.inpainter.inpainter)] = current_time
         return await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
-                                         self.verbose)
+                                         self.verbose, use_igpu=self.use_igpu)
 
     async def _run_text_rendering(self, config: Config, ctx: Context):
         current_time = time.time()
@@ -1691,9 +1695,9 @@ class MangaTranslator:
             logger.info('Loading models')
             if config.upscale.upscale_ratio:
                 await prepare_upscaling(config.upscale.upscaler)
-            await prepare_detection(config.detector.detector)
-            await prepare_ocr(config.ocr.ocr, self.device)
-            await prepare_inpainting(config.inpainter.inpainter, self.device)
+            await prepare_detection(config.detector.detector, use_igpu=self.use_igpu)
+            await prepare_ocr(config.ocr.ocr, self.device, use_igpu=self.use_igpu)
+            await prepare_inpainting(config.inpainter.inpainter, self.device, use_igpu=self.use_igpu)
             await prepare_translation(config.translator.translator_gen)
             if config.colorizer.colorizer != Colorizer.none:
                 await prepare_colorization(config.colorizer.colorizer)

@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 import os
 import shutil
+from collections import OrderedDict
 from torch import Tensor
 
 from .common import OfflineInpainter
@@ -51,7 +52,85 @@ class LamaMPEInpainter(OfflineInpainter):
             self.model.to(device)
 
     async def _unload(self):
+        if getattr(self, 'use_igpu', False):
+            self.compiled_shapes.clear()
+            self.ov_model = None
+            self.core = None
         del self.model
+
+    def _load_openvino(self):
+        # LaMa Large is much faster on this machine's OpenVINO CPU than Gen9 GPU.
+        # Keep AOT's device selection independent of LaMa's fixed CPU policy.
+        self.ov_device = 'CPU' if isinstance(self, LamaLargeInpainter) else os.environ.get('MANGA_OPENVINO_DEVICE', 'GPU')
+        self.precision = os.environ.get('MANGA_OPENVINO_PRECISION', 'f32')
+        if self.precision not in ('f32', 'f16'):
+            raise ValueError('OpenVINO precision must be f32 or f16')
+        if isinstance(self.model, LamaFourier) and self.precision != 'f32':
+            self.logger.warning('LaMa OpenVINO uses FP32 to preserve Fourier inpainting quality')
+            self.precision = 'f32'
+        if isinstance(self, LamaLargeInpainter):
+            self.logger.info('LaMa Large uses OpenVINO CPU FP32; global GPU device settings are ignored')
+        self.ov_model = None
+        self.compiled_shapes = OrderedDict()
+        try:
+            import openvino as ov
+            self.core = ov.Core()
+            # AOT's dilation-16 reflection padding needs more than 16 pixels
+            # after its two downsampling layers, so trace at 128 rather than 64.
+            image = torch.zeros(1, 3, 128, 128)
+            mask = torch.zeros(1, 1, 128, 128)
+            mask[:, :, 32:96, 32:96] = 1
+            with torch.inference_mode():
+                network = self.model.generator if isinstance(self.model, LamaFourier) else self.model
+                self.ov_model = ov.convert_model(network,
+                    example_input=(image, mask),
+                    input=[[1, 3, -1, -1], [1, 1, -1, -1]])
+        except Exception as exc:
+            self._fallback_openvino(exc)
+
+    def _fallback_openvino(self, exc):
+        self.ov_model = None
+        self.compiled_shapes.clear()
+        self.execution_devices = ['PyTorch CPU']
+        self.logger.warning('Inpainting OpenVINO failed; using PyTorch CPU: %s', exc)
+
+    def _forward_openvino(self, image, mask):
+        shape = tuple(image.shape)
+        if shape not in self.compiled_shapes:
+            model = self.ov_model.clone()
+            model.reshape({model.input(0): list(shape), model.input(1): list(mask.shape)})
+            config = {'INFERENCE_PRECISION_HINT': self.precision}
+            cache = os.environ.get('MANGA_OPENVINO_CACHE_DIR')
+            if cache:
+                config['CACHE_DIR'] = cache
+            # Full-frame inpainting can be large; retain only the latest shape.
+            self.compiled_shapes.clear()
+            compiled = self.core.compile_model(model, self.ov_device, config)
+            self.compiled_shapes[shape] = compiled
+            self.execution_devices = list(compiled.get_property('EXECUTION_DEVICES'))
+            self.logger.info('Inpainting OpenVINO shape %s execution devices: %s', shape, self.execution_devices)
+        compiled = self.compiled_shapes[shape]
+        result = compiled([np.ascontiguousarray(image.detach().cpu().numpy()),
+                           np.ascontiguousarray(mask.detach().cpu().numpy())])
+        if len(compiled.outputs) != 1:
+            raise ValueError('Unexpected inpainting output count')
+        output = np.array(result[compiled.output(0)], copy=True)
+        if output.shape != shape or not np.isfinite(output).all():
+            raise ValueError('Unexpected inpainting output layout or nonfinite values')
+        output = torch.from_numpy(output)
+        if isinstance(self.model, LamaFourier):
+            # Match LamaFourier.__call__, including composition before resizing.
+            output = output * mask + (1 - mask) * image
+        return output
+
+    def _forward(self, image, mask):
+        if getattr(self, 'use_igpu', False) and self.ov_model is not None:
+            try:
+                return self._forward_openvino(image, mask)
+            except Exception as exc:
+                self._fallback_openvino(exc)
+        # Retry after leaving the exception handler, releasing failed GPU work.
+        return self.model(image, mask)
 
     async def _infer(self, image: np.ndarray, mask: np.ndarray, config: InpainterConfig, inpainting_size: int = 1024, verbose: bool = False) -> np.ndarray:
         img_original = np.copy(image)
@@ -92,7 +171,7 @@ class LamaMPEInpainter(OfflineInpainter):
             img_torch *= (1 - mask_torch)
             if not (self.device.startswith('cuda')):
                 # mps devices here
-                img_inpainted_torch = self.model(img_torch, mask_torch)
+                img_inpainted_torch = self._forward(img_torch, mask_torch)
             else:
                 # Note: lama's weight shouldn't be convert to fp16 or bf16 otherwise it produces darkened results.
                 # but it can inference under torch.autocast
@@ -104,7 +183,7 @@ class LamaMPEInpainter(OfflineInpainter):
                     self.logger.warning('Switch to bf16 due to Lama only compatible with bf16 and fp32.')
 
                 with torch.autocast(device_type="cuda", dtype=precision):
-                    img_inpainted_torch = self.model(img_torch, mask_torch)
+                    img_inpainted_torch = self._forward(img_torch, mask_torch)
 
         if isinstance(self.model, LamaFourier):
             img_inpainted_torch = img_inpainted_torch.to(torch.float32)
@@ -128,12 +207,18 @@ class LamaLargeInpainter(LamaMPEInpainter):
         },
     }
 
-    async def _load(self, device: str):
+    async def _load(self, device: str, use_igpu: bool = False):
+        self.use_igpu = use_igpu
+        if use_igpu:
+            device = "cpu"
         self.model = load_lama_mpe(self._get_file_path('lama_large_512px.ckpt'), device='cpu', use_mpe=False, large_arch=True)
         self.model.eval()
         self.device = device
         if device.startswith('cuda') or device == 'mps' or device == 'xpu':
             self.model.to(device)
+        self.execution_devices = ["PyTorch CPU"] if device == "cpu" else [device]
+        if use_igpu:
+            self._load_openvino()
 
 
 

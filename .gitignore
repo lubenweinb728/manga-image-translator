@@ -29,7 +29,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+/lib/
 lib64/
 parts/
 sdist/
@@ -51,3 +51,22 @@ MANIFEST
 # SSL Used for running server locally
 cert.pem
 key.pem
+
+# v0.1 runtime state and downloaded assets
+.pytest_cache/
+*.log
+*.errors.txt
+*.pyc
+/MangaStudio_Data/temp/
+/MangaStudio_Data/profiles/
+/MangaStudio_Data/gpt_configs/
+/MangaStudio_Data/studio_config.json
+/fonts/*.ttf
+/fonts/*.ttc
+/fonts/*.otf
+node_modules/
+/front/build/
+/front/.react-router/
+*.bin
+*.pth
+*.safetensors
